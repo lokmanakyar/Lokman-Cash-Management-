@@ -1,0 +1,677 @@
+# Python ortamının bulunduğu klasöre xa adında excel dosyasını eklemen lazım, unutma..
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from skopt import gp_minimize
+from skopt.space import Real 
+from skopt.utils import use_named_args 
+import xlsxwriter
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- Sabit Maliyetler ve Parametreler ---
+# Bu sabitler, bankanızın politikalarına göre güncellenmelidir.
+COST_OF_CASH_ORAN = 0.405 / 365         # Günlük %0.110 -> Yıllık %40.5 Ekim 2025 Haftalık Repo faiz oranı
+TASIMA_SABIT = 393.39 * 1.2            # ≈ 472 TL taşıma maliyeti (Normal Sipariş/Transfer)
+SAYIM_100BIN = 108.84 * 1.2            # ≈ 130.6 TL 100.000 TL için sayım maliyeti
+
+# Acil takviye mekanizması kaldırıldığı için ilgili sabitler çıkarıldı.
+
+MIN_NAKIT_TRANSFER_ILK_ESIK = 150_000 # Orijinal eşiğe döndü
+NAKIT_TRANSFER_ARTIS_MIKTARI = 50_000 # Orijinal
+MIN_OPERASYONEL_KASA_ESIK = 50_000    # Optimizasyon için mutlak minimum kasa eşiği (operasyonel yeterlilik için)
+
+# Karşılama oranı ve maksimum karşılama tutarı için sabitler (orijinale döndü)
+YATAN_ORANI_COK_YUKSEK_ESIK = 1       # Yatan/Çeken oranı 1'den büyükse veya eşitse
+YATAN_ORANI_YUKSEK_ESIK = 0.8         # Yatan/Çeken oranı 0.8'den büyükse
+YATAN_ORANI_ORTA_ESIK = 0.6           # Yatan/Çeken oranı 0.6'dan büyükse
+
+MAKS_KARSILAMA_TUTARI_COK_YUKSEK = 750_000
+MAKS_KARSILAMA_TUTARI_YUKSEK = 600_000
+MAKS_KARSILAMA_TUTARI_ORTA = 450_000
+MAKS_KARSILAMA_TUTARI_DUSUK = 300_000
+
+KARSILAMA_ORANI_COK_YUKSEK = 0.20
+KARSILAMA_ORANI_YUKSEK = 0.15
+KARSILAMA_ORANI_ORTA = 0.10
+KARSILAMA_ORANI_DUSUK = 0.05
+
+# YENİ: Sınıf bazlı uyarlamalar için sabitler
+# Transfer eşiği: Yatan ağırlıklıda düşük (özendir), Çeken ağırlıklıda yüksek (muhafazakar)
+SINIF_TRANSFER_ESIK = {
+    'Yatan_Agırlıklı': 100_000,
+    'Çeken_Agırlıklı': 200_000,
+    'Dengeli': MIN_NAKIT_TRANSFER_ILK_ESIK  # Orijinal
+}
+
+# Karşılama oranı ölçekleme: Yatan için +%10, Çeken için -%5
+SINIF_KARSILAMA_OLCEK = {
+    'Yatan_Agırlıklı': 1.10,
+    'Çeken_Agırlıklı': 0.95,
+    'Dengeli': 1.00
+}
+
+# Veri Dosyası ve Çıktı Dosyası Adları
+VERI_DOSYASI = r'C:\Users\l.akyar\Desktop\Nakit_Yönetimi\Input\xa_TRY.xlsx' 
+CIKTI_DOSYASI = r'C:\Users\l.akyar\Desktop\Nakit_Yönetimi\Output\kasa_optimizasyon_sonuclari_proaktif.xlsx'
+
+def load_data(file_path):
+    """
+    Veri dosyasını yükler ve gerekli ön işlemleri yapar.
+    Sütun adlarının kontrolünü ve temizliğini içerir.
+    """
+    print(f"Veri yükleniyor: '{file_path}'...")
+    try:
+        df = pd.read_excel(file_path)
+        print("Veri başarıyla yüklendi.")
+    except FileNotFoundError:
+        print(f"Hata: '{file_path}' bulunamadı. Lütfen dosya yolunu kontrol edin.")
+        return None
+
+    # Excel'den gelmesi beklenen tüm sütun adları
+    excel_columns = [
+        "TARIH", "SUBE_KODU", "HAFTA_NO", "GUN_ADI", "HAFTA_TIPI",
+        "BASLANGIC_BAKIYE_TL", "NAKIT_YATAN_TL", "NAKIT_CEKEN_TL",
+        "MAX_NAKIT_YATAN_TL", "MAX_NAKIT_CEKEN_TL", "ATM_DEN_GELEN_TL",
+        "ATM_YE_GIDEN_TL", "TL_TALEP", "TL_DEVIR",
+        "GUN_SONU_KASA_BAKIYE_TL_SUBE", "ATM_AKSAM_KASA_TL",
+        "ATM_NAKIT_CEKEN_MUSTERI_TL", "ATM_NAKIT_YATAN_MUSTERI_TL",
+        "GUNCELLENMIS_NAKIT_YATAN_TL", "GUNCELLENMIS_NAKIT_CEKEN_TL"
+    ]
+
+    # Tüm gerekli sütunların DataFrame'de olup olmadığını kontrol edin, eksikse 0 ile doldurun
+    for col in excel_columns:
+        if col not in df.columns:
+            print(f"Uyarı: Excel dosyasında '{col}' sütunu bulunamadı. 0 değeriyle doldurulacaktır.")
+            df[col] = 0
+
+    # Numerik sütunları temizle ve float'a çevir
+    numeric_cols_to_clean = [
+        'BASLANGIC_BAKIYE_TL', 'NAKIT_YATAN_TL', 'NAKIT_CEKEN_TL',
+        'MAX_NAKIT_YATAN_TL', 'MAX_NAKIT_CEKEN_TL', 'ATM_DEN_GELEN_TL',
+        'ATM_YE_GIDEN_TL', 'TL_TALEP', 'TL_DEVIR',
+        "GUN_SONU_KASA_BAKIYE_TL_SUBE", "ATM_AKSAM_KASA_TL",
+        "ATM_NAKIT_CEKEN_MUSTERI_TL", "ATM_NAKIT_YATAN_MUSTERI_TL",
+        "GUNCELLENMIS_NAKIT_YATAN_TL", "GUNCELLENMIS_NAKIT_CEKEN_TL"
+    ]
+    for col in numeric_cols_to_clean:
+        df[col] = df[col].astype(str).str.replace(' ', '').str.replace(',', '').str.replace('-\xa0\xa0', '0')
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    print("Numerik sütunlar temizlendi ve dönüştürüldü.")
+
+    # Tarih sütununu datetime formatına çevir ve geçersiz tarihleri kaldır
+    df['TARIH'] = pd.to_datetime(df['TARIH'], errors='coerce')
+    df = df.dropna(subset=['TARIH']) 
+    print("Tarih sütunu datetime formatına çevrildi.")
+
+    # ATM müşteri nakit çekim ve yatırım bakiyelerini ana GUNCELLENMIS sütunlara ekle
+    df['GUNCELLENMIS_NAKIT_CEKEN_TL'] = df['GUNCELLENMIS_NAKIT_CEKEN_TL'] + df['ATM_NAKIT_CEKEN_MUSTERI_TL']
+    df['GUNCELLENMIS_NAKIT_YATAN_TL'] = df['GUNCELLENMIS_NAKIT_YATAN_TL'] + df['ATM_NAKIT_YATAN_MUSTERI_TL']
+    print("ATM müşteri nakit hareketleri ana 'Güncellenmiş' sütunlara eklendi.")
+
+    # Toplam gün sonu kasa tutarını hesapla (Şube Kasası + ATM Kasası) - Baseline maliyet için kullanılır
+    df['AKSAM_KASA_TUTARI'] = df['GUN_SONU_KASA_BAKIYE_TL_SUBE'] + df['ATM_AKSAM_KASA_TL']
+    print("Toplam akşam kasa tutarı (şube + ATM) hesaplandı.")
+
+    # Reel (Baseline) maliyetleri hesaplama fonksiyonu
+    def calculate_baseline_costs(row):
+        nakit_faiz = row['AKSAM_KASA_TUTARI'] * COST_OF_CASH_ORAN
+        total_transfer_cost = 0
+        total_counting_cost = 0
+
+        # TL_TALEP: Merkezden Şubeye (Giriş) - Maliyet oluşturur
+        if pd.notna(row['TL_TALEP']) and row['TL_TALEP'] > 0:
+            total_transfer_cost += TASIMA_SABIT
+            total_counting_cost += (row['TL_TALEP'] / 100_000) * SAYIM_100BIN
+        
+        # TL_DEVIR: Şubeden Merkeze (Çıkış) - Maliyet oluşturur
+        if pd.notna(row['TL_DEVIR']) and row['TL_DEVIR'] > 0:
+            total_transfer_cost += TASIMA_SABIT
+            total_counting_cost += (row['TL_DEVIR'] / 100_000) * SAYIM_100BIN
+            
+        return nakit_faiz, total_transfer_cost, total_counting_cost
+
+    # Reel maliyetleri DataFrame'e uygula ve toplam maliyeti hesapla
+    reel_maliyet_detaylari_df = df.apply(calculate_baseline_costs, axis=1, result_type='expand')
+    df[['reel_nakit_faiz_maliyeti', 'reel_tasima_maliyeti', 'reel_sayim_maliyeti']] = reel_maliyet_detaylari_df
+    df['reel_maliyet_toplam'] = df['reel_nakit_faiz_maliyeti'] + df['reel_tasima_maliyeti'] + df['reel_sayim_maliyeti']
+    print("Gerçek (baseline) maliyetler hesaplandı (TL_TALEP ve TL_DEVIR dahil).")
+
+    # Aylık ve yıllık dönem bilgileri ekle
+    df['YIL_AY'] = df['TARIH'].dt.to_period('M')
+    df['YIL'] = df['TARIH'].dt.year
+    print("Aylık ve yıllık dönem bilgileri eklendi.")
+
+    return df
+
+def classify_sube_class(df_group):
+    """
+    YENİ: Aylık yatan/çekilen oranına göre şube sınıfını belirler.
+    """
+    total_yatan = df_group['GUNCELLENMIS_NAKIT_YATAN_TL'].sum()
+    total_cekilen = df_group['GUNCELLENMIS_NAKIT_CEKEN_TL'].sum()
+    
+    if total_cekilen <= 0:
+        return 'Dengeli'
+    
+    oran = total_yatan / total_cekilen
+    
+    if oran > YATAN_ORANI_COK_YUKSEK_ESIK:
+        return 'Yatan_Agırlıklı'
+    elif oran < YATAN_ORANI_YUKSEK_ESIK:
+        return 'Çeken_Agırlıklı'
+    else:
+        return 'Dengeli'
+
+def calculate_min_max_esik_aylik(df_aylik):
+    """
+    Aylık bazda optimum kasa eşiği için min ve max arama eşiklerini belirler.
+    """
+    gunluk_cekilenler = df_aylik['GUNCELLENMIS_NAKIT_CEKEN_TL']
+    
+    if gunluk_cekilenler.empty or gunluk_cekilenler.sum() == 0:
+        return MIN_OPERASYONEL_KASA_ESIK, MIN_OPERASYONEL_KASA_ESIK + 200_000
+
+    min_esik = max(MIN_OPERASYONEL_KASA_ESIK, int(gunluk_cekilenler.quantile(0.05)))
+    max_esik = int(gunluk_cekilenler.quantile(0.95) * 1.5)
+
+    if min_esik >= max_esik:
+        min_esik = MIN_OPERASYONEL_KASA_ESIK
+        max_esik = max(min_esik + 200_000, int(min_esik * 1.5))
+    
+    if max_esik - min_esik < 100000:
+        max_esik = min_esik + 100000
+
+    return int(min_esik), int(max_esik)
+
+def hesapla_karsilama_bilgisi(cikan, giren, sinif_olcek=1.0):
+    """
+    Güncel çekilen ve yatan tutarlara göre içsel karşılama oranını ve maksimum karşılama tutarını hesaplar.
+    YENİ: Sınıf ölçeğini uygula.
+    """
+    if cikan <= 0:
+        yatan_orani = 1
+    else:
+        yatan_orani = giren / cikan
+
+    karsilama_orani = 0
+    maksimum_karsilama_tutari = 0
+
+    if giren == 0:
+        karsilama_orani = 0
+        maksimum_karsilama_tutari = 0
+    elif yatan_orani > YATAN_ORANI_YUKSEK_ESIK:
+        karsilama_orani = KARSILAMA_ORANI_COK_YUKSEK * sinif_olcek
+        maksimum_karsilama_tutari = MAKS_KARSILAMA_TUTARI_COK_YUKSEK
+    elif YATAN_ORANI_ORTA_ESIK <= yatan_orani <= YATAN_ORANI_YUKSEK_ESIK:
+        karsilama_orani = KARSILAMA_ORANI_YUKSEK * sinif_olcek
+        maksimum_karsilama_tutari = MAKS_KARSILAMA_TUTARI_YUKSEK
+    elif yatan_orani < YATAN_ORANI_ORTA_ESIK:
+        karsilama_orani = KARSILAMA_ORANI_DUSUK * sinif_olcek
+        maksimum_karsilama_tutari = MAKS_KARSILAMA_TUTARI_DUSUK
+    
+    return karsilama_orani, maksimum_karsilama_tutari
+
+
+def simulate_costs_for_given_esik(kasa_esik_val, df_aylik_data, tasima_sabit_const, sayim_100bin_const, cost_of_cash_oran_const, sinif_esik=150_000, sinif_olcek=1.0):
+    """
+    Belirlenen optimum kasa eşiği için günlük nakit akışını simüle eder ve maliyetleri hesaplar.
+    YENİ: Sınıf bazlı transfer eşiği ve karşılama ölçeğini kullan.
+    """
+    if df_aylik_data.empty:
+        return {
+            'TOPLAM_MALIYET': float('inf'),
+            'NAKIT_FAIZ_MALIYETI': float('inf'),
+            'TASIMA_MALIYETI': float('inf'),
+            'SAYIM_MALIYETI': float('inf')
+        }, []
+
+    total_coc_maliyeti = 0
+    total_tasima_maliyeti = 0
+    total_sayim_maliyeti = 0
+    daily_sim_results = []
+
+    start_date = df_aylik_data['TARIH'].min()
+    end_date = df_aylik_data['TARIH'].max()
+
+    if pd.isna(start_date) or pd.isna(end_date):
+        return {
+            'TOPLAM_MALIYET': float('inf'),
+            'NAKIT_FAIZ_MALIYETI': float('inf'),
+            'TASIMA_MALIYETI': float('inf'),
+            'SAYIM_MALIYETI': float('inf')
+        }, []
+
+    df_merged_sim = pd.merge(pd.DataFrame({'TARIH': pd.date_range(start=start_date, end=end_date)}), 
+                             df_aylik_data[['TARIH', 'GUNCELLENMIS_NAKIT_YATAN_TL', 'GUNCELLENMIS_NAKIT_CEKEN_TL', 'TL_DEVIR', 'TL_TALEP', 'MAX_NAKIT_CEKEN_TL']],
+                             on='TARIH', how='left').fillna(0)
+    
+    simule_bakiye_onceki_gun = kasa_esik_val
+
+    for i, row in df_merged_sim.iterrows():
+        mevcut_bakiye_gun_basi = simule_bakiye_onceki_gun
+        current_day_tasima_maliyeti = 0
+        current_day_sayim_maliyeti = 0
+        operasyon_aciklamasi = "Optimum Kasa Aralığında"
+        takviye_miktari_model = 0
+        merkeze_gonderilen_miktar_model = 0
+
+        next_day_max_cekilen = 0
+        if i + 1 < len(df_merged_sim):
+            next_day_max_cekilen = df_merged_sim.iloc[i+1]['MAX_NAKIT_CEKEN_TL']
+            
+        # GÜNCELLEME: Tamponı sadeleştir (1.0x çarpan kaldır, sadece next_day + tampon)
+        target_closing_for_today = max(kasa_esik_val, next_day_max_cekilen + MIN_OPERASYONEL_KASA_ESIK * 0.8)
+        target_closing_for_today = max(target_closing_for_today, MIN_OPERASYONEL_KASA_ESIK)
+
+        cekilen_musteri = row['GUNCELLENMIS_NAKIT_CEKEN_TL'] 
+        yatan_musteri = row['GUNCELLENMIS_NAKIT_YATAN_TL']    
+        
+        karsilama_orani, maksimum_karsilama_tutari = hesapla_karsilama_bilgisi(
+            cekilen_musteri, yatan_musteri, sinif_olcek
+        )
+        karsilanacak_tutar = min(yatan_musteri * karsilama_orani, maksimum_karsilama_tutari if maksimum_karsilama_tutari > 0 else float('inf'))
+        
+        net_gunluk_nakit_hareketi_musteri = yatan_musteri - cekilen_musteri + karsilanacak_tutar
+        
+        bakiye_islem_sonrasi_musteri = mevcut_bakiye_gun_basi + net_gunluk_nakit_hareketi_musteri
+
+        simule_bakiye_gun_sonu = bakiye_islem_sonrasi_musteri 
+
+        if bakiye_islem_sonrasi_musteri < target_closing_for_today: 
+            takviye_miktar = target_closing_for_today - bakiye_islem_sonrasi_musteri
+            current_day_tasima_maliyeti = tasima_sabit_const 
+            current_day_sayim_maliyeti = (takviye_miktar / 100_000) * sayim_100bin_const
+            simule_bakiye_gun_sonu = target_closing_for_today 
+            operasyon_aciklamasi = f"Kasa Yetersiz: {takviye_miktar:,.0f} TL Takviye (Kapanış Hedefe)"
+            takviye_miktari_model = takviye_miktar 
+        elif bakiye_islem_sonrasi_musteri > target_closing_for_today: 
+            fazla_nakit_miktari = bakiye_islem_sonrasi_musteri - target_closing_for_today
+            
+            transfer_amount_to_send = 0
+            if fazla_nakit_miktari >= sinif_esik:  # YENİ: Sınıf bazlı eşik
+                transfer_amount_to_send = sinif_esik
+                while (transfer_amount_to_send + NAKIT_TRANSFER_ARTIS_MIKTARI) <= fazla_nakit_miktari:
+                    transfer_amount_to_send += NAKIT_TRANSFER_ARTIS_MIKTARI
+
+                # GÜNCELLEME: %80 kuralı kaldır - tam transfer
+                # No cap
+            
+            potential_bakiye_after_transfer = bakiye_islem_sonrasi_musteri - transfer_amount_to_send
+
+            if transfer_amount_to_send > 0 and potential_bakiye_after_transfer >= target_closing_for_today:
+                current_day_tasima_maliyeti = tasima_sabit_const
+                current_day_sayim_maliyeti = (transfer_amount_to_send / 100_000) * sayim_100bin_const
+                simule_bakiye_gun_sonu = potential_bakiye_after_transfer 
+                operasyon_aciklamasi = (f"Kasa Fazla: {transfer_amount_to_send:,.0f} TL Merkeze Gönder "
+                                       f"(Kapanış Bakiye: {simule_bakiye_gun_sonu:,.0f} TL)")
+                merkeze_gonderilen_miktar_model = transfer_amount_to_send 
+            else:
+                simule_bakiye_gun_sonu = bakiye_islem_sonrasi_musteri 
+                operasyon_aciklamasi = (f"Kasa Fazla: {fazla_nakit_miktari:,.0f} TL "
+                                       f"(Transfer Yapılmadı - Kapanış Hedefe Ulaşmak İçin Kaldı veya Hacim Yetersiz)")
+        
+        current_day_coc_maliyeti = max(0, simule_bakiye_gun_sonu) * cost_of_cash_oran_const
+        
+        daily_sim_results.append({
+            'Tarih': row['TARIH'].strftime('%Y-%m-%d'),
+            'Optimum Kasa Eşiği': kasa_esik_val,
+            'Hedef Gün Sonu Bakiye': target_closing_for_today, 
+            'Net Çekim İhtiyacı (Karşılama Sonrası)': max(0, cekilen_musteri - karsilanacak_tutar), 
+            'Simüle Gün Başı Bakiye': mevcut_bakiye_gun_basi, 
+            'Net Günlük Nakit Hareketi (Müşteri+Karşılama)': net_gunluk_nakit_hareketi_musteri, 
+            'Bakiye İşlem Sonrası (Müşteri Hareketleri)': bakiye_islem_sonrasi_musteri, 
+            'Simüle Gün Sonu Bakiye': simule_bakiye_gun_sonu, 
+            'Operasyon Açıklaması': operasyon_aciklamasi,
+            'Günlük Nakit Faiz Maliyeti': current_day_coc_maliyeti,
+            'Günlük Taşıma Maliyeti': current_day_tasima_maliyeti,
+            'Günlük Sayım Maliyeti': current_day_sayim_maliyeti,
+            'Günlük Toplam Maliyet': current_day_coc_maliyeti + current_day_tasima_maliyeti + current_day_sayim_maliyeti,
+            'TL_DEVIR_Reel_Bugun': row['TL_DEVIR'], 
+            'TL_TALEP_Reel_Bugun': row['TL_TALEP'], 
+            'Takviye_Miktari_Model': takviye_miktari_model,
+            'Merkeze_Gonderilen_Miktar_Model': merkeze_gonderilen_miktar_model,
+        })
+
+        total_coc_maliyeti += current_day_coc_maliyeti
+        total_tasima_maliyeti += current_day_tasima_maliyeti
+        total_sayim_maliyeti += current_day_sayim_maliyeti
+        
+        simule_bakiye_onceki_gun = simule_bakiye_gun_sonu
+    
+    return {
+        'TOPLAM_MALIYET': total_coc_maliyeti + total_tasima_maliyeti + total_sayim_maliyeti,
+        'NAKIT_FAIZ_MALIYETI': total_coc_maliyeti,
+        'TASIMA_MALIYETI': total_tasima_maliyeti,
+        'SAYIM_MALIYETI': total_sayim_maliyeti
+    }, daily_sim_results
+
+def run_analysis_and_optimize(df):
+    """
+    Ana analiz ve optimizasyon döngüsünü çalıştırır.
+    YENİ: Şube sınıfını hesapla ve simülasyona uygula.
+    """
+    summary_output_data = [] 
+    all_daily_results = []   
+
+    grouped_data = df.groupby(['SUBE_KODU', 'YIL_AY'])
+    num_groups = len(grouped_data)
+    print(f"Toplam {num_groups} şube-ay dönemi için analiz yapılacak.")
+    
+    if num_groups == 0:
+        print("Uyarı: Grup oluşturulamadı. Lütfen giriş verinizin SUBE_KODU ve TARIH sütunlarını kontrol edin.")
+
+    for i, ((sube_kodu, yil_ay), df_group) in enumerate(grouped_data):
+        print(f"\n--- Analiz ediliyor: Şube Kodu: {sube_kodu}, Dönem: {yil_ay} ({i+1}/{num_groups}) ---")
+        
+        # YENİ: Şube sınıfını hesapla
+        sinif = classify_sube_class(df_group)
+        print(f"  Şube Sınıfı: {sinif}")
+        
+        sinif_transfer_esik = SINIF_TRANSFER_ESIK.get(sinif, MIN_NAKIT_TRANSFER_ILK_ESIK)
+        sinif_karsilama_olcek = SINIF_KARSILAMA_OLCEK.get(sinif, 1.0)
+        print(f"  Sınıf Bazlı Transfer Eşiği: {sinif_transfer_esik:,.0f} TL, Karşılama Ölçeği: {sinif_karsilama_olcek}")
+        
+        min_esik_aylik, max_esik_aylik = calculate_min_max_esik_aylik(df_group)
+            
+        if max_esik_aylik <= min_esik_aylik: 
+            max_esik_aylik = min_esik_aylik + 1000 
+
+        print(f"  Belirlenen min/max kasa eşikleri: {min_esik_aylik:,.0f} TL / {max_esik_aylik:,.0f} TL")
+
+        # OPTIMIZASYON 1: Basit toplam maliyet minimizasyonu (ağırlık/risk kaldırıldı)
+        @use_named_args([Real(min_esik_aylik, max_esik_aylik, name='kasa_esik')])
+        def objective_function_for_optimization(kasa_esik):
+            costs_dict, _ = simulate_costs_for_given_esik(
+                kasa_esik, df_group, TASIMA_SABIT, SAYIM_100BIN, COST_OF_CASH_ORAN,
+                sinif_transfer_esik, sinif_karsilama_olcek
+            )
+            return costs_dict['TOPLAM_MALIYET']
+
+        try:
+            print(f"  Optimizasyon 1: Toplam maliyet minimizasyonu başlıyor...")
+            start_time_opt1 = datetime.now()
+            res_gp_total_cost = gp_minimize(
+                objective_function_for_optimization,
+                [(min_esik_aylik, max_esik_aylik)],
+                n_calls=50, 
+                random_state=0
+            )
+            end_time_opt1 = datetime.now()
+            print(f"  Optimizasyon 1 tamamlandı. Süre: {end_time_opt1 - start_time_opt1}")
+
+            optimum_kasa_opt1 = int(res_gp_total_cost.x[0])
+            opt1_sim_results, daily_detail_opt1_full = simulate_costs_for_given_esik(
+                optimum_kasa_opt1, df_group, TASIMA_SABIT, SAYIM_100BIN, COST_OF_CASH_ORAN,
+                sinif_transfer_esik, sinif_karsilama_olcek
+            )
+            print(f"  Optimum Kasa Eşiği (Toplam Maliyet): {optimum_kasa_opt1:,.0f} TL")
+            print(f"  Minimum Toplam Maliyet (Opt1): {opt1_sim_results['TOPLAM_MALIYET']:,.2f} TL")
+
+        except Exception as e:
+            print(f"  HATA (Opt 1): Optimizasyon 1 sırasında bir hata oluştu: {e}")
+            optimum_kasa_opt1 = np.nan
+            opt1_sim_results = {k: np.nan for k in ['TOPLAM_MALIYET', 'NAKIT_FAIZ_MALIYETI', 'TASIMA_MALIYETI', 'SAYIM_MALIYETI']}
+            daily_detail_opt1_full = []
+
+        # Günlük Detayları Kaydetme (aynı)
+        df_opt1_daily = pd.DataFrame(daily_detail_opt1_full)
+
+        columns_to_rename_base = [
+            'Optimum Kasa Eşiği', 'Hedef Gün Sonu Bakiye', 
+            'Net Çekim İhtiyacı (Karşılama Sonrası)',
+            'Simüle Gün Başı Bakiye', 'Net Günlük Nakit Hareketi (Müşteri+Karşılama)', 
+            'Bakiye İşlem Sonrası (Müşteri Hareketleri)', 
+            'Simüle Gün Sonu Bakiye',
+            'Operasyon Açıklaması', 'Günlük Nakit Faiz Maliyeti',
+            'Günlük Taşıma Maliyeti', 'Günlük Sayım Maliyeti', 'Günlük Toplam Maliyet',
+            'TL_DEVIR_Reel_Bugun', 'TL_TALEP_Reel_Bugun', 
+            'Takviye_Miktari_Model', 'Merkeze_Gonderilen_Miktar_Model',
+        ]
+
+        if not df_opt1_daily.empty:
+            rename_dict_opt1 = {col: col + '_Opt1' for col in columns_to_rename_base if col in df_opt1_daily.columns}
+            df_opt1_daily = df_opt1_daily.rename(columns=rename_dict_opt1)
+            if 'Tarih' in df_opt1_daily.columns:
+                df_opt1_daily['Tarih_Opt1'] = df_opt1_daily['Tarih']
+                df_opt1_daily = df_opt1_daily.drop(columns=['Tarih'])
+            else:
+                df_opt1_daily['Tarih_Opt1'] = pd.NaT 
+        else:
+            df_opt1_daily = pd.DataFrame(columns=[col + '_Opt1' for col in columns_to_rename_base] + ['Tarih_Opt1'])
+            
+        df_group_for_merge = df_group.copy()
+        df_group_for_merge['Tarih_merge_key'] = df_group_for_merge['TARIH'].dt.strftime('%Y-%m-%d')
+
+        merged_df_for_daily_results = pd.merge(
+            df_group_for_merge,
+            df_opt1_daily,
+            left_on='Tarih_merge_key', right_on='Tarih_Opt1', how='left'
+        )
+        merged_df_for_daily_results = merged_df_for_daily_results.fillna(0) 
+
+        for _, row_detail in merged_df_for_daily_results.iterrows():
+            all_daily_results.append({
+                'SUBE_KODU': sube_kodu,
+                'TARIH': row_detail['Tarih_merge_key'],
+                'YIL_AY': str(yil_ay),
+                'GUNCELLENMIS_NAKIT_YATAN_TL': row_detail['GUNCELLENMIS_NAKIT_YATAN_TL'],
+                'GUNCELLENMIS_NAKIT_CEKEN_TL': row_detail['GUNCELLENMIS_NAKIT_CEKEN_TL'],
+                'TL_TALEP_Reel': row_detail['TL_TALEP'],
+                'TL_DEVIR_Reel': row_detail['TL_DEVIR'],
+                'GUN_SONU_KASA_BAKIYE_TL_SUBE': row_detail['GUN_SONU_KASA_BAKIYE_TL_SUBE'],
+                'ATM_AKSAM_KASA_TL': row_detail['ATM_AKSAM_KASA_TL'], 
+                'AKSAM_KASA_TUTARI_GERCEK': row_detail['AKSAM_KASA_TUTARI'],
+                'Reel_Toplam_Maliyet': row_detail['reel_maliyet_toplam'],
+                'Reel_Nakit_Faiz_Maliyeti': row_detail['reel_nakit_faiz_maliyeti'],
+                'Reel_Tasima_Maliyeti': row_detail['reel_tasima_maliyeti'],
+                'Reel_Sayim_Maliyeti': row_detail['reel_sayim_maliyeti'],
+                
+                # Opt1 Detayları
+                'Optimum_Kasa_Opt1': row_detail.get('Optimum Kasa Eşiği_Opt1', 0), 
+                'Hedef_Gun_Sonu_Bakiye_Opt1': row_detail.get('Hedef Gün Sonu Bakiye_Opt1', 0), 
+                'Simule_Gun_Basi_Bakiye_Opt1': row_detail.get('Simüle Gün Başı Bakiye_Opt1', 0), 
+                'Simule_Kasa_Bakiye_Opt1': row_detail.get('Simüle Gün Sonu Bakiye_Opt1', 0),
+                'Model_Nakit_Faiz_Maliyeti_Opt1': row_detail.get('Günlük Nakit Faiz Maliyeti_Opt1', 0),
+                'Model_Tasima_Maliyeti_Opt1': row_detail.get('Günlük Taşıma Maliyeti_Opt1', 0),
+                'Model_Sayım_Maliyeti_Opt1': row_detail.get('Günlük Sayım Maliyeti_Opt1', 0),
+                'Model_Toplam_Maliyet_Opt1': row_detail.get('Günlük Toplam Maliyet_Opt1', 0),
+                'Opt1_Operasyon_Aciklamasi': row_detail.get('Operasyon Açıklaması_Opt1', ''),
+                'Opt1_Takviye_Miktari_Model': row_detail.get('Takviye_Miktari_Model_Opt1', 0),
+                'Opt1_Merkeze_Gonderilen_Miktar_Model': row_detail.get('Merkeze_Gonderilen_Miktar_Model_Opt1', 0),
+                'Net_Gunluk_Nakit_Hareketleri_Musteri_Opt1': row_detail.get('Net Günlük Nakit Hareketi (Müşteri+Karşılama)_Opt1', 0), 
+                'Bakiye_Islem_Sonrasi_Musteri_Opt1': row_detail.get('Bakiye İşlem Sonrası (Müşteri Hareketleri)_Opt1', 0), 
+                'TL_DEVIR_Reel_Bugun_Opt1': row_detail.get('TL_DEVIR_Reel_Bugun_Opt1', 0), 
+                'TL_TALEP_Reel_Bugun_Opt1': row_detail.get('TL_TALEP_Reel_Bugun_Opt1', 0), 
+                # YENİ: Sınıf bilgisi
+                'Sube_Sinifi': sinif,
+            })
+        
+        opt1_days_below_zero = (merged_df_for_daily_results['Simule_Kasa_Bakiye_Opt1'] < 0).sum() if 'Simule_Kasa_Bakiye_Opt1' in merged_df_for_daily_results.columns else 0
+
+        ozet_row = {
+            'Şube Kodu': sube_kodu,
+            'Analiz Dönemi': str(yil_ay),
+            'Şube Sınıfı': sinif,  # YENİ
+            'Belirlenen Min Kasa Eşiği Opt. Aralığı': min_esik_aylik,
+            'Belirlenen Max Kasa Eşiği Opt. Aralığı': max_esik_aylik,
+            'Optimum Kasa Eşiği (Toplam Maliyet Opt)': optimum_kasa_opt1,
+            'Model Toplam Maliyet (Toplam Maliyet Opt)': opt1_sim_results['TOPLAM_MALIYET'],
+            'Model Nakit Faiz Maliyeti (Toplam Maliyet Opt)': opt1_sim_results['NAKIT_FAIZ_MALIYETI'],
+            'Model Taşıma Maliyeti (Toplam Maliyet Opt)': opt1_sim_results['TASIMA_MALIYETI'],
+            'Model Sayım Maliyeti (Toplam Maliyet Opt)': opt1_sim_results['SAYIM_MALIYETI'],
+            'Riskli Gün Sayısı (Toplam Maliyet Opt)': opt1_days_below_zero,
+            'Reel Toplam Maliyet (Baseline)': df_group['reel_maliyet_toplam'].sum(),
+            'Reel Nakit Faiz Maliyeti (Baseline)': df_group['reel_nakit_faiz_maliyeti'].sum(),
+            'Reel Taşıma Maliyeti (Baseline)': df_group['reel_tasima_maliyeti'].sum(),
+            'Reel Sayım Maliyeti (Baseline)': df_group['reel_sayim_maliyeti'].sum(),
+            'Baseline Ortalama Gün Sonu Kasa': df_group['AKSAM_KASA_TUTARI'].mean(), 
+            'Opt1 Ortalama Gün Sonu Kasa': df_opt1_daily['Simüle Gün Sonu Bakiye_Opt1'].mean() if 'Simüle Gün Sonu Bakiye_Opt1' in df_opt1_daily.columns and not df_opt1_daily.empty else np.nan,
+            'Opt1 Kar/Zarar (TL)': df_group['reel_maliyet_toplam'].sum() - (opt1_sim_results['TOPLAM_MALIYET'] if not np.isnan(opt1_sim_results['TOPLAM_MALIYET']) else 0),
+            'Reel Ortalama ATM Akşam Kasa': df_group['ATM_AKSAM_KASA_TL'].mean() 
+        }
+        summary_output_data.append(ozet_row)
+    
+    if not summary_output_data:
+        print("\nUyarı: Hiçbir şube-ay dönemi için geçerli veri bulunamadı veya tüm dönemler atlandı. Özet sonuçlar DataFrame'i boş.")
+
+    return pd.DataFrame(summary_output_data), pd.DataFrame(all_daily_results)
+
+def write_results_to_excel(summary_df, daily_detail_df, output_file_path):
+    """
+    Analiz sonuçlarını Excel dosyasına yazar.
+    YENİ: Şube sınıfı sütununu ekle.
+    """
+    output_dir = os.path.dirname(output_file_path)
+    
+    if not os.path.exists(output_dir):
+        print(f"Çıktı klasörü oluşturuluyor: '{output_dir}'")
+        os.makedirs(output_dir)
+
+    print(f"\nSonuçlar Excel dosyasına yazılıyor: '{output_file_path}'...")
+    try:
+        with pd.ExcelWriter(output_file_path, engine='xlsxwriter') as writer:
+            workbook = writer.book
+            header_format = workbook.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
+            money_format = workbook.add_format({'num_format': '#,##0.00', 'border': 1})
+            int_format = workbook.add_format({'num_format': '#,##0', 'border': 1})
+
+            # 1. Detaylı Günlük Sonuçlar Sayfası
+            if not daily_detail_df.empty:
+                daily_detail_df.to_excel(writer, sheet_name='Detaylı Günlük Sonuçlar', index=False)
+                worksheet = writer.sheets['Detaylı Günlük Sonuçlar']
+                for col_num, value in enumerate(daily_detail_df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
+                
+                money_cols_daily = [
+                    'GUNCELLENMIS_NAKIT_YATAN_TL', 'GUNCELLENMIS_NAKIT_CEKEN_TL', 'TL_TALEP_Reel', 'TL_DEVIR_Reel',
+                    'GUN_SONU_KASA_BAKIYE_TL_SUBE', 'ATM_AKSAM_KASA_TL', 'AKSAM_KASA_TUTARI_GERCEK',
+                    'Reel_Toplam_Maliyet', 'Reel_Nakit_Faiz_Maliyeti', 'Reel_Tasima_Maliyeti', 'Reel_Sayim_Maliyeti',
+                    'Optimum_Kasa_Opt1', 'Hedef_Gun_Sonu_Bakiye_Opt1', 
+                    'Simule_Gun_Basi_Bakiye_Opt1', 
+                    'Simule_Kasa_Bakiye_Opt1', 'Model_Nakit_Faiz_Maliyeti_Opt1',
+                    'Model_Tasima_Maliyeti_Opt1', 'Model_Sayım_Maliyeti_Opt1', 'Model_Toplam_Maliyeti_Opt1',
+                    'Opt1_Takviye_Miktari_Model', 'Opt1_Merkeze_Gonderilen_Miktar_Model', 
+                    'Net_Gunluk_Nakit_Hareketleri_Musteri_Opt1', 'Bakiye_Islem_Sonrasi_Musteri_Opt1',
+                    'TL_DEVIR_Reel_Bugun_Opt1', 'TL_TALEP_Reel_Bugun_Opt1'
+                ]
+                
+                for col in money_cols_daily:
+                    if col in daily_detail_df.columns:
+                        col_idx = daily_detail_df.columns.get_loc(col)
+                        worksheet.set_column(col_idx, col_idx, None, money_format)
+                print(f"'Detaylı Günlük Sonuçlar' sayfası '{output_file_path}' dosyasına yazıldı.")
+            else:
+                print("Detaylı günlük sonuçlar boş olduğu için 'Detaylı Günlük Sonuçlar' sayfası oluşturulmadı.")
+
+            # 2. Özet Rapor Sayfası
+            if not summary_df.empty:
+                summary_df.to_excel(writer, sheet_name='Özet Rapor', index=False)
+                worksheet = writer.sheets['Özet Rapor']
+                for col_num, value in enumerate(summary_df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
+                
+                money_cols_summary = [
+                    'Optimum Kasa Eşiği (Toplam Maliyet Opt)', 'Model Toplam Maliyet (Toplam Maliyet Opt)',
+                    'Model Nakit Faiz Maliyeti (Toplam Maliyet Opt)', 'Model Taşıma Maliyeti (Toplam Maliyet Opt)',
+                    'Model Sayım Maliyeti (Toplam Maliyet Opt)',
+                    'Reel Toplam Maliyet (Baseline)', 'Reel Nakit Faiz Maliyeti (Baseline)',
+                    'Reel Taşıma Maliyeti (Baseline)', 'Reel Sayım Maliyeti (Baseline)',
+                    'Baseline Ortalama Gün Sonu Kasa', 
+                    'Opt1 Ortalama Gün Sonu Kasa',
+                    'Opt1 Kar/Zarar (TL)',
+                    'Belirlenen Min Kasa Eşiği Opt. Aralığı', 'Belirlenen Max Kasa Eşiği Opt. Aralığı',
+                    'Reel Ortalama ATM Akşam Kasa' 
+                ]
+                int_cols_summary = ['Riskli Gün Sayısı (Toplam Maliyet Opt)'] 
+
+                for col in money_cols_summary:
+                    if col in summary_df.columns:
+                        col_idx = summary_df.columns.get_loc(col)
+                        worksheet.set_column(col_idx, col_idx, None, money_format)
+                for col in int_cols_summary:
+                    if col in summary_df.columns:
+                        col_idx = summary_df.columns.get_loc(col)
+                        worksheet.set_column(col_idx, col_idx, None, int_format)
+
+                print(f"'Özet Rapor' sayfası '{output_file_path}' dosyasına yazıldı.")
+            else:
+                print("Özet verileri boş olduğu için 'Özet Rapor' sayfası oluşturulmadı.")
+
+            # 3. Reel ve Model Karşılaştırma Özeti Sayfası
+            if not summary_df.empty:
+                comparison_df = summary_df[[
+                    'Şube Kodu',
+                    'Analiz Dönemi', 
+                    'Şube Sınıfı',  # YENİ
+                    'Reel Toplam Maliyet (Baseline)',
+                    'Reel Nakit Faiz Maliyeti (Baseline)',
+                    'Reel Taşıma Maliyeti (Baseline)',
+                    'Reel Sayım Maliyeti (Baseline)',
+                    'Baseline Ortalama Gün Sonu Kasa', 
+                    'Reel Ortalama ATM Akşam Kasa', 
+                    'Optimum Kasa Eşiği (Toplam Maliyet Opt)', 
+                    'Model Toplam Maliyet (Toplam Maliyet Opt)',
+                    'Model Nakit Faiz Maliyeti (Toplam Maliyet Opt)',
+                    'Model Taşıma Maliyeti (Toplam Maliyet Opt)',
+                    'Model Sayım Maliyeti (Toplam Maliyet Opt)',
+                    'Opt1 Ortalama Gün Sonu Kasa',
+                    'Opt1 Kar/Zarar (TL)',
+                ]]
+                
+                comparison_df['Opt1 Kar/Zarar Oranı (%)'] = (comparison_df['Opt1 Kar/Zarar (TL)'] / comparison_df['Reel Toplam Maliyet (Baseline)']) * 100
+                comparison_df['Opt1 Kar/Zarar Oranı (%)'] = comparison_df['Opt1 Kar/Zarar Oranı (%)'].replace([np.inf, -np.inf], 0).fillna(0)
+
+
+                comparison_df.to_excel(writer, sheet_name='Model Karsilastirma', index=False)
+                worksheet = writer.sheets['Model Karsilastirma']
+                for col_num, value in enumerate(comparison_df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
+
+                money_cols_comparison = [
+                    'Reel Toplam Maliyet (Baseline)', 'Reel Nakit Faiz Maliyeti (Baseline)',
+                    'Reel Taşıma Maliyeti (Baseline)', 'Reel Sayım Maliyeti (Baseline)',
+                    'Baseline Ortalama Gün Sonu Kasa', 'Reel Ortalama ATM Akşam Kasa', 
+                    'Optimum Kasa Eşiği (Toplam Maliyet Opt)', 'Model Toplam Maliyet (Toplam Maliyet Opt)',
+                    'Model Nakit Faiz Maliyeti (Toplam Maliyet Opt)', 'Model Taşıma Maliyeti (Toplam Maliyet Opt)',
+                    'Model Sayım Maliyeti (Toplam Maliyet Opt)', 'Opt1 Ortalama Gün Sonu Kasa',
+                    'Opt1 Kar/Zarar (TL)'
+                ]
+                
+                percent_format = workbook.add_format({'num_format': '0.00%', 'border': 1})
+
+                for col in money_cols_comparison:
+                    if col in comparison_df.columns:
+                        col_idx = comparison_df.columns.get_loc(col)
+                        worksheet.set_column(col_idx, col_idx, None, money_format)
+                
+                if 'Opt1 Kar/Zarar Oranı (%)' in comparison_df.columns:
+                    col_idx = comparison_df.columns.get_loc('Opt1 Kar/Zarar Oranı (%)')
+                    worksheet.set_column(col_idx, col_idx, None, percent_format)
+
+
+                print(f"'Model Karsilastirma' sayfası '{output_file_path}' dosyasına yazıldı.")
+            else:
+                print("Karşılaştırma verileri boş olduğu için 'Model Karsilastirma' sayfası oluşturulmadı.")
+                
+            print(f"Başarıyla Excel dosyasına yazıldı: '{output_file_path}'")
+            
+            
+    except Exception as e:
+        print(f"HATA: Excel dosyasına yazma sırasında bir hata oluştu: {e}")
+
+def main():
+    """
+    Ana çalışma fonksiyonu.
+    """
+    df = load_data(VERI_DOSYASI)
+    if df is not None:
+        summary_df, daily_detail_df = run_analysis_and_optimize(df)
+        write_results_to_excel(summary_df, daily_detail_df, CIKTI_DOSYASI)
+    else:
+        print("Analiz için geçerli veri yüklenemedi. Program sonlandırılıyor.")
+
+if __name__ == '__main__':
+    main()

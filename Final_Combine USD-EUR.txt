@@ -1,0 +1,509 @@
+# -*- coding: utf-8 -*-
+# Otomatik Politika Kalibrasyonu (USD & EUR) — FIXED: kasa_esik / kasa_esik_val uyumsuzluğu
+# - Çoklu parametre optimizasyonu (gp_minimize)
+# - Amaç: Toplam Maliyet (CoC + Taşıma + Sayım) minimize
+# - Karar değişkenleri: kasa_esik, deadband_pct, min_lot, nextday_cap_pct, transfer_esik_scale, karsilama_scale
+# - Çıktı: Şube–ay bazında önerilen parametreler + net tasarruflar
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from skopt import gp_minimize
+from skopt.space import Real
+from skopt.utils import use_named_args
+import xlsxwriter
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+# -------------------- Para Birimi Konfigürasyonu --------------------
+def currency_config(currency: str):
+    currency = currency.upper()
+    if currency == "USD":
+        return {
+            "COST_OF_CASH_ORAN": 0.0425 / 365.0,
+            "KUR_TL_FX": 41.57,
+            "TASIMA_SABIT_TL": 393.39 * 1.2,     # ~472 TL
+            "SAYIM_100BIN_TL": 108.84 * 1.2,     # 100K TL başına sayım
+            "SAYIM_CARPANI_FX": 32.11,           # TL muadili (oran değil)
+            "MUTLAK_MAKSIMUM_KASA": 400_000,
+            "MIN_OPER_KASA": 25_000,
+            "LOT_ADIMI": 10_000,                 # transfer artış adımı
+            "MIN_TRANSFER_ESIK": 50_000,
+        }
+    elif currency == "EUR":
+        return {
+            "COST_OF_CASH_ORAN": 0.0215 / 365.0,
+            "KUR_TL_FX": 48.65,
+            "TASIMA_SABIT_TL": 393.39 * 1.2,
+            "SAYIM_100BIN_TL": 108.84 * 1.2,
+            "SAYIM_CARPANI_FX": 32.11,           # gerekirse değiştir
+            "MUTLAK_MAKSIMUM_KASA": 400_000,
+            "MIN_OPER_KASA": 25_000,
+            "LOT_ADIMI": 10_000,
+            "MIN_TRANSFER_ESIK": 50_000,
+        }
+    else:
+        raise ValueError("currency must be 'USD' or 'EUR'")
+
+# Karşılama eşikleri (ortak)
+YATAN_ORANI_COK_YUKSEK_ESIK = 1.0
+YATAN_ORANI_YUKSEK_ESIK     = 0.8
+YATAN_ORANI_ORTA_ESIK       = 0.6
+
+MAKS_KARSILAMA_TUTARI_COK_YUKSEK = 150_000
+MAKS_KARSILAMA_TUTARI_YUKSEK     = 125_000
+MAKS_KARSILAMA_TUTARI_ORTA       = 100_000
+MAKS_KARSILAMA_TUTARI_DUSUK      = 75_000
+
+KARSILAMA_ORANI_COK_YUKSEK = 0.20
+KARSILAMA_ORANI_YUKSEK     = 0.15
+KARSILAMA_ORANI_ORTA       = 0.10
+KARSILAMA_ORANI_DUSUK      = 0.05
+
+# Sınıf bazlı transfer eşiği (temel)
+SINIF_TRANSFER_ESIK = {
+    'Yatan_Agırlıklı': 350_000,
+    'Çeken_Agırlıklı': 100_000,
+    'Dengeli': 150_000
+}
+
+# -------------------- Yardımcı Fonksiyonlar --------------------
+def counting_cost_fx(amount_fx: float, cfg) -> float:
+    """TL muadili -> 100K TL başı sayım -> FX'e dönüşüm."""
+    if pd.isna(amount_fx) or amount_fx <= 0:
+        return 0.0
+    efektif_tl = amount_fx * cfg["SAYIM_CARPANI_FX"]
+    return (efektif_tl / 100_000.0) * cfg["SAYIM_100BIN_TL"] / cfg["KUR_TL_FX"]
+
+def backward_compat(df: pd.DataFrame, currency: str) -> pd.DataFrame:
+    """USD/EUR sütun isimleri arasında geri uyumluluk sağlar."""
+    cur = currency.upper()
+    if cur == "USD":
+        expected = [
+            "BASLANGIC_BAKIYE_USD","NAKIT_YATAN_USD","NAKIT_CEKEN_USD",
+            "MAX_NAKIT_YATAN_USD","MAX_NAKIT_CEKEN_USD","ATM_DEN_GELEN_USD",
+            "ATM_YE_GIDEN_USD","USD_TALEP","USD_DEVIR",
+            "GUN_SONU_KASA_BAKIYE_USD_SUBE","ATM_AKSAM_KASA_USD",
+            "ATM_NAKIT_CEKEN_MUSTERI_USD","ATM_NAKIT_YATAN_MUSTERI_USD",
+            "GUNCELLENMIS_NAKIT_YATAN_USD","GUNCELLENMIS_NAKIT_CEKEN_USD"
+        ]
+        for col in expected:
+            if col not in df.columns: df[col] = 0
+    else:
+        mapping = {
+            "BASLANGIC_BAKIYE_EUR": "BASLANGIC_BAKIYE_USD",
+            "NAKIT_YATAN_EUR": "NAKIT_YATAN_USD",
+            "NAKIT_CEKEN_EUR": "NAKIT_CEKEN_USD",
+            "MAX_NAKIT_YATAN_EUR": "MAX_NAKIT_YATAN_USD",
+            "MAX_NAKIT_CEKEN_EUR": "MAX_NAKIT_CEKEN_USD",
+            "ATM_DEN_GELEN_EUR": "ATM_DEN_GELEN_USD",
+            "ATM_YE_GIDEN_EUR": "ATM_YE_GIDEN_USD",
+            "EUR_TALEP": "USD_TALEP",
+            "EUR_DEVIR": "USD_DEVIR",
+            "GUN_SONU_KASA_BAKIYE_EUR_SUBE": "GUN_SONU_KASA_BAKIYE_USD_SUBE",
+            "ATM_AKSAM_KASA_EUR": "ATM_AKSAM_KASA_USD",
+            "ATM_NAKIT_CEKEN_MUSTERI_EUR": "ATM_NAKIT_CEKEN_MUSTERI_USD",
+            "ATM_NAKIT_YATAN_MUSTERI_EUR": "ATM_NAKIT_YATAN_MUSTERI_USD",
+            "GUNCELLENMIS_NAKIT_YATAN_EUR": "GUNCELLENMIS_NAKIT_YATAN_USD",
+            "GUNCELLENMIS_NAKIT_CEKEN_EUR": "GUNCELLENMIS_NAKIT_CEKEN_USD",
+        }
+        for eur_col, usd_col in mapping.items():
+            if eur_col not in df.columns and usd_col in df.columns:
+                df[eur_col] = df[usd_col]
+                print(f"[Uyarı] '{eur_col}' yoktu, '{usd_col}'dan kopyalandı.")
+        expected = list(mapping.keys())
+        for col in expected:
+            if col not in df.columns: df[col] = 0
+    return df
+
+def load_data(file_path, currency):
+    print(f"[{currency}] veri yükleniyor: {file_path}")
+    try:
+        df = pd.read_excel(file_path)
+    except FileNotFoundError:
+        print(f"HATA: dosya yok -> {file_path}")
+        return None
+
+    df = backward_compat(df, currency)
+
+    # Ortak alanlar
+    for col in ["TARIH","SUBE_KODU","HAFTA_NO","GUN_ADI","HAFTA_TIPI"]:
+        if col not in df.columns: df[col] = np.nan
+
+    # Sayısal temizlik
+    numeric_cols = [c for c in df.columns if any(x in c for x in ["USD","EUR","TALEP","DEVIR","KASA"])]
+    for col in numeric_cols:
+        df[col] = df[col].astype(str).str.replace(' ', '').str.replace(',', '').str.replace('-\xa0\xa0','0')
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    df['TARIH'] = pd.to_datetime(df['TARIH'], errors='coerce')
+    df = df.dropna(subset=['TARIH'])
+
+    # ATM müşteri hareketleri ilavesi
+    if currency.upper() == "USD":
+        df['GUNCELLENMIS_NAKIT_CEKEN_USD'] += df.get('ATM_NAKIT_CEKEN_MUSTERI_USD', 0)
+        df['GUNCELLENMIS_NAKIT_YATAN_USD'] += df.get('ATM_NAKIT_YATAN_MUSTERI_USD', 0)
+        df['AKSAM_KASA_TUTARI'] = df.get('GUN_SONU_KASA_BAKIYE_USD_SUBE',0) + df.get('ATM_AKSAM_KASA_USD',0)
+    else:
+        df['GUNCELLENMIS_NAKIT_CEKEN_EUR'] += df.get('ATM_NAKIT_CEKEN_MUSTERI_EUR', 0)
+        df['GUNCELLENMIS_NAKIT_YATAN_EUR'] += df.get('ATM_NAKIT_YATAN_MUSTERI_EUR', 0)
+        df['AKSAM_KASA_TUTARI'] = df.get('GUN_SONU_KASA_BAKIYE_EUR_SUBE',0) + df.get('ATM_AKSAM_KASA_EUR',0)
+
+    # Baseline maliyetler
+    cfg = currency_config(currency)
+    def baseline_costs(row):
+        coc = row['AKSAM_KASA_TUTARI'] * cfg["COST_OF_CASH_ORAN"]
+        tasima = sayim = 0.0
+        if currency.upper() == "USD":
+            if row.get('USD_TALEP',0) > 0:
+                tasima += cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                sayim += counting_cost_fx(row['USD_TALEP'], cfg)
+            if row.get('USD_DEVIR',0) > 0:
+                tasima += cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                sayim += counting_cost_fx(row['USD_DEVIR'], cfg)
+        else:
+            if row.get('EUR_TALEP',0) > 0:
+                tasima += cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                sayim += counting_cost_fx(row['EUR_TALEP'], cfg)
+            if row.get('EUR_DEVIR',0) > 0:
+                tasima += cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                sayim += counting_cost_fx(row['EUR_DEVIR'], cfg)
+        return coc, tasima, sayim
+
+    tmp = df.apply(baseline_costs, axis=1, result_type='expand')
+    df[['reel_nakit_faiz_maliyeti','reel_tasima_maliyeti','reel_sayim_maliyeti']] = tmp
+    df['reel_maliyet_toplam'] = df['reel_nakit_faiz_maliyeti'] + df['reel_tasima_maliyeti'] + df['reel_sayim_maliyeti']
+
+    df['YIL_AY'] = df['TARIH'].dt.to_period('M')
+    print(f"[{currency}] veri hazır ({df['SUBE_KODU'].nunique()} şube, {df['YIL_AY'].nunique()} ay)")
+    return df
+
+def classify_sube_class(df_group, currency):
+    if currency.upper() == "USD":
+        tot_yat = df_group['GUNCELLENMIS_NAKIT_YATAN_USD'].sum()
+        tot_cek = df_group['GUNCELLENMIS_NAKIT_CEKEN_USD'].sum()
+    else:
+        tot_yat = df_group['GUNCELLENMIS_NAKIT_YATAN_EUR'].sum()
+        tot_cek = df_group['GUNCELLENMIS_NAKIT_CEKEN_EUR'].sum()
+
+    if tot_cek <= 0: return 'Dengeli'
+    oran = tot_yat / tot_cek
+    if oran > YATAN_ORANI_COK_YUKSEK_ESIK: return 'Yatan_Agırlıklı'
+    elif oran < YATAN_ORANI_YUKSEK_ESIK:   return 'Çeken_Agırlıklı'
+    else:                                   return 'Dengeli'
+
+def monthly_esik_bounds(df_aylik, currency, cfg):
+    if currency.upper() == "USD":
+        cek = df_aylik['GUNCELLENMIS_NAKIT_CEKEN_USD']
+    else:
+        cek = df_aylik['GUNCELLENMIS_NAKIT_CEKEN_EUR']
+    if cek.empty or cek.sum() == 0:
+        return int(cfg["MIN_OPER_KASA"]), int(min(cfg["MUTLAK_MAKSIMUM_KASA"], cfg["MIN_OPER_KASA"] + 200_000))
+    mn = max(cfg["MIN_OPER_KASA"], int(cek.quantile(0.05)))
+    mx_calc = int(cek.quantile(0.98) * 2.0)
+    mx = min(cfg["MUTLAK_MAKSIMUM_KASA"], mx_calc)
+    if mn >= mx:
+        mn = cfg["MIN_OPER_KASA"]
+        mx = min(cfg["MUTLAK_MAKSIMUM_KASA"], max(mn + 100_000, int(mn * 1.5)))
+    return int(mn), int(mx)
+
+def karsilama_params(cekilen, yatan, karsilama_scale=1.0):
+    if cekilen <= 0: yoran = 1.0
+    else:            yoran = yatan / cekilen
+    if yatan == 0: return 0.0, 0.0
+    if yoran > YATAN_ORANI_YUKSEK_ESIK:
+        return KARSILAMA_ORANI_COK_YUKSEK * karsilama_scale, MAKS_KARSILAMA_TUTARI_COK_YUKSEK
+    elif YATAN_ORANI_ORTA_ESIK <= yoran <= YATAN_ORANI_YUKSEK_ESIK:
+        return KARSILAMA_ORANI_YUKSEK     * karsilama_scale, MAKS_KARSILAMA_TUTARI_YUKSEK
+    else:
+        return KARSILAMA_ORANI_DUSUK      * karsilama_scale, MAKS_KARSILAMA_TUTARI_DUSUK
+
+# -------------------- Simülasyon (parametrik) --------------------
+def simulate_month(
+    df_aylik, currency, cfg,
+    **policy   # <-- kritik fix: kwargs ile al ve alias destekle
+):
+    """
+    Bir ayı verilen politika parametreleriyle simüle eder.
+    Beklenen anahtarlar: kasa_esik, deadband_pct, min_lot, nextday_cap_pct, transfer_esik_scale, karsilama_scale
+    Geriye dönük uyumluluk: kasa_esik yoksa kasa_esik_val okunur.
+    """
+    if df_aylik.empty:
+        return {'TOPLAM_MALIYET': np.inf, 'NAKIT_FAIZ_MALIYETI': np.inf,
+                'TASIMA_MALIYETI': np.inf, 'SAYIM_MALIYETI': np.inf,
+                'transfer_sayisi': 0, 'takviye_sayisi': 0, 'deadband_gun': 0}, []
+
+    # ---- parametreler + alias düzeltme
+    kasa_esik        = policy.get("kasa_esik", policy.get("kasa_esik_val"))
+    deadband_pct     = policy.get("deadband_pct", 0.10)
+    min_lot          = policy.get("min_lot", 50_000)
+    nextday_cap_pct  = policy.get("nextday_cap_pct", 0.10)
+    transfer_esik_scale = policy.get("transfer_esik_scale", 1.0)
+    karsilama_scale  = policy.get("karsilama_scale", 1.0)
+
+    if kasa_esik is None:
+        # minimum güvenlik
+        kasa_esik = cfg["MIN_OPER_KASA"]
+
+    if currency.upper() == "USD":
+        cols = ['TARIH','GUNCELLENMIS_NAKIT_YATAN_USD','GUNCELLENMIS_NAKIT_CEKEN_USD','MAX_NAKIT_CEKEN_USD']
+    else:
+        cols = ['TARIH','GUNCELLENMIS_NAKIT_YATAN_EUR','GUNCELLENMIS_NAKIT_CEKEN_EUR','MAX_NAKIT_CEKEN_EUR']
+
+    for c in cols:
+        if c not in df_aylik.columns: df_aylik[c] = 0
+
+    start_date = df_aylik['TARIH'].min()
+    end_date   = df_aylik['TARIH'].max()
+
+    df_sim = pd.merge(
+        pd.DataFrame({'TARIH': pd.date_range(start=start_date, end=end_date)}),
+        df_aylik[cols], on='TARIH', how='left'
+    ).fillna(0)
+
+    total_coc = total_tasima = total_sayim = 0.0
+    sim_results = []
+    sim_bakiye_prev = kasa_esik
+
+    transfer_count = 0
+    takviye_count  = 0
+    deadband_days  = 0
+
+    sinif = classify_sube_class(df_aylik, currency)
+    base_esik = SINIF_TRANSFER_ESIK.get(sinif, cfg["MIN_TRANSFER_ESIK"])
+    sinif_transfer_esik = max(cfg["MIN_TRANSFER_ESIK"], int(base_esik * transfer_esik_scale))
+
+    for i, row in df_sim.iterrows():
+        if currency.upper() == "USD":
+            cekilen = float(row['GUNCELLENMIS_NAKIT_CEKEN_USD'])
+            yatan   = float(row['GUNCELLENMIS_NAKIT_YATAN_USD'])
+            nextday_max = float(df_sim.iloc[i+1]['MAX_NAKIT_CEKEN_USD']) if i+1 < len(df_sim) else 0.0
+        else:
+            cekilen = float(row['GUNCELLENMIS_NAKIT_CEKEN_EUR'])
+            yatan   = float(row['GUNCELLENMIS_NAKIT_YATAN_EUR'])
+            nextday_max = float(df_sim.iloc[i+1]['MAX_NAKIT_CEKEN_EUR']) if i+1 < len(df_sim) else 0.0
+
+        # Next-day cap
+        capped_nextday = min(nextday_max, kasa_esik * (1.0 + nextday_cap_pct))
+        target_eod = max(kasa_esik, capped_nextday, cfg["MIN_OPER_KASA"])
+
+        # Net müşteri hareketi
+        net_musteri = yatan - cekilen
+        bakiye_islem_sonrasi = sim_bakiye_prev + net_musteri
+
+        # Karşılama yalnızca karar için (çifte sayım yok)
+        koran, max_kar = karsilama_params(cekilen, yatan, karsilama_scale)
+        karsilanacak = min(yatan * koran, max_kar if max_kar > 0 else np.inf)
+        etkin = bakiye_islem_sonrasi + karsilanacak
+
+        # Deadband
+        diff = etkin - target_eod
+        deadband_abs = target_eod * deadband_pct
+
+        tasima = sayim = 0.0
+        aciklama = "Ölü bölge / işlem yok"
+        sim_eod = etkin
+
+        # Güvenlik tavanı
+        if etkin > cfg["MUTLAK_MAKSIMUM_KASA"]:
+            send_amt = etkin - target_eod
+            if send_amt > 0:
+                transfer_count += 1
+                tasima = cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                sayim  = counting_cost_fx(send_amt, cfg)
+                sim_eod = target_eod
+                aciklama = f"Tavan aşıldı: {send_amt:,.0f} merkez"
+        else:
+            if abs(diff) <= deadband_abs:
+                deadband_days += 1
+                sim_eod = etkin
+                aciklama = "Deadband: işlem yok"
+            elif diff < 0:
+                need = -diff
+                if need < min_lot and etkin >= cfg["MIN_OPER_KASA"]:
+                    sim_eod = etkin
+                    aciklama = "Takviye küçük - yapılmadı"
+                else:
+                    takviye_count += 1
+                    tasima = cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                    sayim  = counting_cost_fx(need, cfg)
+                    sim_eod = target_eod
+                    aciklama = f"Takviye: {need:,.0f}"
+            else:
+                excess = diff
+                send_amt = 0.0
+                # sınıf transfer eşiğine göre basamaklama
+                if excess >= sinif_transfer_esik:
+                    send_amt = (excess // cfg["LOT_ADIMI"]) * cfg["LOT_ADIMI"]
+                elif excess >= min_lot:
+                    send_amt = (excess // cfg["LOT_ADIMI"]) * cfg["LOT_ADIMI"]
+                if send_amt > 0 and (etkin - send_amt) >= target_eod:
+                    transfer_count += 1
+                    tasima = cfg["TASIMA_SABIT_TL"] / cfg["KUR_TL_FX"]
+                    sayim  = counting_cost_fx(send_amt, cfg)
+                    sim_eod = etkin - send_amt
+                    aciklama = f"Fazla: {send_amt:,.0f} merkez"
+                else:
+                    sim_eod = etkin
+                    aciklama = "Fazla var ama işlem yok"
+
+        coc = max(0.0, sim_eod) * cfg["COST_OF_CASH_ORAN"]
+
+        sim_results.append({
+            "Tarih": row['TARIH'].strftime('%Y-%m-%d'),
+            "Uymanız_Gereken_EOD_Bakiye": target_eod,
+            "Optimum Kasa Eşiği": kasa_esik,
+            "Simüle Gün Başı Bakiye": sim_bakiye_prev,
+            "Net Günlük Nakit Hareketi (Müşteri)": net_musteri,
+            "Karşılama (etkin)": karsilanacak,
+            "Simüle Gün Sonu Bakiye": sim_eod,
+            "Operasyon Açıklaması": aciklama,
+            "Günlük Nakit Faiz Maliyeti": coc,
+            "Günlük Taşıma Maliyeti": tasima,
+            "Günlük Sayım Maliyeti": sayim,
+            "Günlük Toplam Maliyet": coc + tasima + sayim
+        })
+
+        total_coc   += coc
+        total_tasima+= tasima
+        total_sayim += sayim
+        sim_bakiye_prev = sim_eod
+
+    costs = {
+        "TOPLAM_MALIYET": total_coc + total_tasima + total_sayim,
+        "NAKIT_FAIZ_MALIYETI": total_coc,
+        "TASIMA_MALIYETI": total_tasima,
+        "SAYIM_MALIYETI": total_sayim,
+        "transfer_sayisi": transfer_count,
+        "takviye_sayisi": takviye_count,
+        "deadband_gun": deadband_days
+    }
+    return costs, sim_results
+
+# -------------------- Optimizasyon (çok parametre) --------------------
+def optimize_month(df_group, currency, y_ay, cfg):
+    # sınırlar
+    min_esik, max_esik = monthly_esik_bounds(df_group, currency, cfg)
+
+    # baseline (reel)
+    reel_total = df_group['reel_maliyet_toplam'].sum()
+
+    # arama uzayı
+    space  = [
+        Real(min_esik, max_esik,   name="kasa_esik"),
+        Real(0.05, 0.25,           name="deadband_pct"),
+        Real(20_000, 150_000,      name="min_lot"),
+        Real(0.00, 0.30,           name="nextday_cap_pct"),
+        Real(0.5, 2.0,             name="transfer_esik_scale"),
+        Real(0.8, 1.2,             name="karsilama_scale"),
+    ]
+
+    @use_named_args(space)
+    def objective(**pars):
+        costs, _ = simulate_month(df_group, currency, cfg, **pars)
+        return costs["TOPLAM_MALIYET"]  # taşıma+sayım+CoC zaten içeriyor
+
+    res = gp_minimize(objective, space, n_calls=50, random_state=0)
+
+    best = {k:v for k,v in zip(
+        ["kasa_esik","deadband_pct","min_lot","nextday_cap_pct","transfer_esik_scale","karsilama_scale"],
+        res.x
+    )}
+    best_costs, best_daily = simulate_month(df_group, currency, cfg, **best)
+
+    # metrikler
+    model_total = best_costs["TOPLAM_MALIYET"]
+    net_saving  = reel_total - model_total
+    net_pct     = (net_saving / reel_total * 100.0) if reel_total > 0 else np.nan
+
+    return best, best_costs, best_daily, {
+        "reel_total": reel_total, "model_total": model_total, "net_saving": net_saving,
+        "net_pct": net_pct, "min_esik": min_esik, "max_esik": max_esik
+    }
+
+# -------------------- Ana Koşu --------------------
+def run_tuning(input_path, output_path, currency):
+    cfg = currency_config(currency)
+    df = load_data(input_path, currency)
+    if df is None or df.empty:
+        print("Veri yok.")
+        return
+
+    summary_rows = []
+    daily_rows   = []
+
+    grouped = df.groupby(["SUBE_KODU","YIL_AY"])
+    print(f"{currency}: {len(grouped)} şube–ay optimize edilecek.")
+
+    for (sube, yilay), g in grouped:
+        print(f"  -> {sube} | {yilay}")
+        try:
+            best_pars, best_costs, daily, meta = optimize_month(g, currency, yilay, cfg)
+        except Exception as e:
+            print(f"  HATA optimize: {e}")
+            continue
+
+        # günlük sonuçlar
+        for d in daily:
+            daily_rows.append({
+                "SUBE_KODU": sube,
+                "YIL_AY": str(yilay),
+                **d
+            })
+
+        # özet satırı
+        summary_rows.append({
+            "SUBE_KODU": sube,
+            "YIL_AY": str(yilay),
+            "Currency": currency.upper(),
+            "Min_Eşik": meta["min_esik"],
+            "Max_Eşik": meta["max_esik"],
+            # Önerilen politika:
+            "Seçilen_Kasa_Eşik": int(best_pars["kasa_esik"]),
+            "Deadband_%": round(best_pars["deadband_pct"]*100,2),
+            "Min_Lot": int(best_pars["min_lot"]),
+            "Nextday_Cap_%": round(best_pars["nextday_cap_pct"]*100,2),
+            "Transfer_Eşik_Scale": round(best_pars["transfer_esik_scale"],2),
+            "Karşılama_Scale": round(best_pars["karsilama_scale"],2),
+            # Maliyetler
+            "Reel_Toplam": meta["reel_total"],
+            "Model_Toplam": meta["model_total"],
+            "Net_Tasarruf": meta["net_saving"],
+            "Net_Tasarruf_%": meta["net_pct"],
+            "Model_CoC": best_costs["NAKIT_FAIZ_MALIYETI"],
+            "Model_Taşıma": best_costs["TASIMA_MALIYETI"],
+            "Model_Sayım": best_costs["SAYIM_MALIYETI"],
+            "Transfer_Sayısı": best_costs["transfer_sayisi"],
+            "Takviye_Sayısı": best_costs["takviye_sayisi"],
+            "Deadband_Gün": best_costs["deadband_gun"],
+        })
+
+    if not summary_rows and not daily_rows:
+        print("Çıktı oluşmadı.")
+        return
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        if summary_rows:
+            sdf = pd.DataFrame(summary_rows)
+            sdf.to_excel(writer, sheet_name="Policy_Tuning_Summary", index=False)
+        if daily_rows:
+            ddf = pd.DataFrame(daily_rows)
+            ddf.to_excel(writer, sheet_name="Detaylı Günlük Sonuçlar", index=False)
+    print(f"OK: {output_path}")
+
+# -------------------- Çalıştırma --------------------
+if __name__ == "__main__":
+    # USD
+    run_tuning(
+        input_path=r"C:\Users\l.akyar\Desktop\Nakit_Yönetimi\Input\xa_USD.xlsx",
+        output_path=r"C:\Users\l.akyar\Desktop\Nakit_Yönetimi\Output\policy_tuning_USD.xlsx",
+        currency="USD"
+    )
+    # EUR
+    run_tuning(
+        input_path=r"C:\Users\l.akyar\Desktop\Nakit_Yönetimi\Input\xa_EUR.xlsx",
+        output_path=r"C:\Users\l.akyar\Desktop\Nakit_Yönetimi\Output\policy_tuning_EUR.xlsx",
+        currency="EUR"
+    )
